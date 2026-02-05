@@ -1,0 +1,27 @@
+[
+  {
+    "content": "在△ABC中，AB=AC=5，BC=6，点D在边BC上，且BD=2DC，则AD的长为（ ）",
+    "options": [
+      "A. √13",
+      "B. √15",
+      "C. 4",
+      "D. √17"
+    ],
+    "answer": "A",
+    "analysis": "作AE⊥BC于E，由等腰三角形性质得BE=EC=3，AE=√(AB²-BE²)=4。BD=2DC且BD+DC=6，得BD=4，DC=2。DE=BD-BE=1。在Rt△ADE中，AD=√(AE²+DE²)=√(16+1)=√17。",
+    "function_formula": null,
+    "subject": "数学",
+    "added_date": "2026-02-05",
+    "review_count": 0
+  },
+  {
+    "subject": "化学",
+    "content": "📸 ",
+    "image_path": "uploaded_images\\微信图片_20260205103926_175_4.jpg",
+    "answer": "见图",
+    "analysis": "",
+    "is_image_upload": true,
+    "added_date": "2026-02-05",
+    "review_count": 0
+  }
+]
