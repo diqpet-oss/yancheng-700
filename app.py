@@ -14,11 +14,12 @@ from io import BytesIO
 
 # ================= 1. 配置与初始化 =================
 
-# 读取 Key
+# 读取 Key (优先从 Secrets 读取，如果没有则用本地占位符)
 if "DEEPSEEK_API_KEY" in st.secrets:
     DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 else:
-    DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxx" # 本地测试用
+    # 🔴 🔴 🔴 如果你在本地运行，请在这里填入你的真实 Key
+    DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 BASE_URL = "https://api.deepseek.com"
 
@@ -30,7 +31,10 @@ st.set_page_config(
 )
 
 # 建立 Google Sheets 连接
-conn = st.connection("gsheets", type=GSheetsConnection)
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except:
+    pass # 防止本地未配置 secrets 报错
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=BASE_URL)
 
@@ -41,31 +45,27 @@ def get_countdown():
     today = datetime.date.today()
     return (exam_date - today).days
 
-# --- ☁️ 云端数据库操作 (核心修改) ---
+# --- ☁️ 云端数据库操作 ---
 
 def load_mistakes():
     """从 Google Sheets 读取错题"""
     try:
-        # ttl=0 表示不缓存，每次强制读取最新数据
         df = conn.read(ttl=0)
-        # 填充空值，防止报错
         df = df.fillna("")
         return df.to_dict(orient="records")
     except Exception as e:
-        st.error(f"连接数据库失败，请检查 Secrets 配置: {e}")
+        # 如果连接失败，返回空列表，不阻断程序
         return []
 
 def save_mistake(question_data):
     """保存错题到 Google Sheets"""
     try:
-        # 1. 读取现有数据
         existing_data = conn.read(ttl=0)
         
-        # 2. 准备新数据行
+        # 确保 question_data 中的字段完整
         new_row = {
             "subject": question_data.get("subject", "综合"),
-            "content": question_data.get("content", ""),
-            # 选项如果是列表，转成字符串存
+            "content": question_data.get("content") or question_data.get("question") or "题目内容缺失",
             "options": str(question_data.get("options", [])),
             "answer": question_data.get("answer", ""),
             "analysis": question_data.get("analysis", ""),
@@ -73,41 +73,36 @@ def save_mistake(question_data):
             "added_date": str(datetime.date.today()),
             "review_count": 0,
             "is_image_upload": question_data.get("is_image_upload", False),
-            "image_base64": question_data.get("image_base64", "") # 图片转码
+            "image_base64": question_data.get("image_base64", "")
         }
         
-        # 3. 查重 (简单的内容查重)
+        # 简单查重
         if not new_row["is_image_upload"]:
-            if not existing_data.empty and new_row["content"] in existing_data["content"].values:
-                return False
+            if not existing_data.empty and "content" in existing_data.columns:
+                if new_row["content"] in existing_data["content"].values:
+                    return False
 
-        # 4. 追加数据
         new_df = pd.DataFrame([new_row])
         updated_df = pd.concat([existing_data, new_df], ignore_index=True)
-        
-        # 5. 写回 Google Sheets
         conn.update(data=updated_df)
         return True
         
     except Exception as e:
-        st.error(f"保存失败: {e}")
+        st.error(f"保存云端失败: {e}")
         return False
 
-# 图片转 Base64 字符串 (为了存入表格)
 def image_to_base64(uploaded_file):
     try:
         bytes_data = uploaded_file.getvalue()
-        # 压缩图片以适应表格限制
         img = Image.open(BytesIO(bytes_data))
         if img.mode != 'RGB':
             img = img.convert('RGB')
-        # 限制大小，宽最多800
         if img.width > 800:
             ratio = 800 / img.width
             img = img.resize((800, int(img.height * ratio)))
         
         buffered = BytesIO()
-        img.save(buffered, format="JPEG", quality=60) # 降低质量压缩
+        img.save(buffered, format="JPEG", quality=60)
         img_str = base64.b64encode(buffered.getvalue()).decode()
         return img_str
     except:
@@ -133,7 +128,7 @@ def get_review_status(added_date_str):
     else:
         return False, f"✅ 记忆保鲜中 (已过{days_diff}天)"
 
-# --- AI 生成相关 ---
+# --- AI 生成相关 (已修复 None 问题) ---
 def generate_questions_batch(subject, type_choice, count=3):
     no_image_instruction = ""
     if subject in ["数学", "物理"]:
@@ -142,13 +137,13 @@ def generate_questions_batch(subject, type_choice, count=3):
     prompt = f"""
     你是盐城中考出题专家。出 {count} 道【{subject}】【{type_choice}】。
     要求：难度中考冲刺级。{no_image_instruction}
-    格式：JSON List:
-    [{{ "content": "内容", "options": [], "answer": "答案", "analysis": "解析", "function_formula": null }}]
+    格式：严格返回 JSON Array，每个对象包含字段：content(题目文本), options(数组), answer, analysis。
+    示例：[{{ "content": "...", "options": ["A","B"], "answer": "A", "analysis": "..." }}]
     """
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "system", "content": "JSON Array Only"}, {"role": "user", "content": prompt}],
+            messages=[{"role": "system", "content": "You must return a valid JSON Array."}, {"role": "user", "content": prompt}],
             stream=False
         )
         content = re.sub(r'```json\s*|\s*```', '', response.choices[0].message.content)
@@ -158,24 +153,30 @@ def generate_questions_batch(subject, type_choice, count=3):
         return []
 
 def generate_daily_mix_automatically():
+    # 修改了 Prompt，强制要求 content 字段
     prompt = """
-    请为盐城初三学生生成一份“今日晨测”小卷，包含3道题：
-    1. 数学题 (压轴题或填空题)
-    2. 英语题 (单选或填空)
-    3. 物理题 (计算或简答)
-    严禁出识图题。严格返回 JSON List。
+    生成一份“盐城中考晨测”，包含3道题：
+    1. 数学 (填空或计算)
+    2. 英语 (单选)
+    3. 物理 (选择或简答)
+    
+    【重要】：
+    - 返回纯 JSON Array。
+    - 题目内容字段名必须是 "content"。
+    - 包含字段: subject, content, options, answer, analysis。
     """
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "system", "content": "JSON Array Only"}, {"role": "user", "content": prompt}],
+            messages=[{"role": "system", "content": "Output valid JSON Array only. Key 'content' is mandatory."}, {"role": "user", "content": prompt}],
             stream=False
         )
         content = re.sub(r'```json\s*|\s*```', '', response.choices[0].message.content)
         data = json.loads(content)
-        # 日报不存表格，只存在 Session State 里，除非用户点保存
         return data
     except Exception as e:
+        # 如果出错，打印出来方便调试
+        st.error(f"生成失败，AI 返回了无法解析的内容: {e}")
         return []
 
 def plot_function(formula_str):
@@ -192,10 +193,15 @@ def plot_function(formula_str):
 # ================= 3. 侧边栏 =================
 with st.sidebar:
     st.title("☁️ 全能提分系统")
-    menu = st.radio("功能模块：", ["🏠 冲刺作战室", "📅 今日专属日报", "🤖 定向刷题", "📸 错题录入", "📓 云端错题本"], index=0)
+    menu = st.radio("功能模块：", ["🏠 冲刺作战室", "📅 今日专属日报", "🤖 定向刷题", "📸 错题录入", "📓 云端错题本"], index=1)
     st.markdown("---")
     st.metric("中考倒计时", f"{get_countdown()} 天")
-    st.success("数据库状态：已连接 Google Sheets ✅")
+    
+    # 状态检查
+    if "gsheets" in st.secrets:
+        st.success("数据库状态：已连接 Google Sheets ✅")
+    else:
+        st.warning("⚠️ 未连接云端数据库 (本地模式)")
 
 # ================= 4. 主页面 =================
 
@@ -222,18 +228,37 @@ if menu == "🏠 冲刺作战室":
 
 elif menu == "📅 今日专属日报":
     st.title("📅 今日智能日报")
-    if st.button("🚀 生成今日任务"):
-        with st.spinner("AI 正在云端出题..."):
+    
+    if st.button("🚀 生成今日任务 (点击一次即可)", type="primary"):
+        with st.spinner("AI 正在云端出题 (约5-10秒)..."):
             res = generate_daily_mix_automatically()
-            st.session_state.daily_tasks = res
+            if res:
+                st.session_state.daily_tasks = res
+                st.rerun()
             
     if "daily_tasks" in st.session_state and st.session_state.daily_tasks:
         for i, q in enumerate(st.session_state.daily_tasks):
             with st.container(border=True):
-                st.write(q.get('content'))
-                if st.button(f"💾 保存到云端", key=f"d_s_{i}"):
-                    if save_mistake(q): st.success("已同步至 Google Sheets")
-                    else: st.warning("保存失败或已存在")
+                # 【关键修复】兼容多种字段名，防止 None
+                content = q.get('content') or q.get('question') or q.get('title') or "⚠️ 题目生成格式异常，请重试"
+                sub = q.get('subject', '综合')
+                
+                st.markdown(f"**第 {i+1} 题 [{sub}]**")
+                st.markdown(f"##### {content}") # 使用 Markdown 渲染题目，更清晰
+                
+                if q.get('options'): 
+                    st.radio("选项", q['options'], key=f"d_opt_{i}")
+                
+                c1, c2 = st.columns([1,1])
+                if c1.button("👀 看答案", key=f"d_ans_{i}"):
+                    st.session_state[f"d_show_{i}"] = True
+                if c2.button("💾 保存到云端", key=f"d_s_{i}"):
+                    if save_mistake(q): st.success("✅ 已同步至 Google Sheets")
+                    else: st.warning("⚠️ 保存失败，可能已存在")
+                    
+                if st.session_state.get(f"d_show_{i}"):
+                    st.info(f"答案：{q.get('answer')}")
+                    st.caption(f"解析：{q.get('analysis')}")
 
 elif menu == "🤖 定向刷题":
     st.title("🤖 AI 定向特训")
@@ -247,16 +272,20 @@ elif menu == "🤖 定向刷题":
     if "ai_qs" in st.session_state:
         for i, q in enumerate(st.session_state.ai_qs):
             with st.expander(f"题目 {i+1}", expanded=True):
-                st.write(q.get('content'))
-                if st.button(f"💾 存入云端错题本", key=f"ai_s_{i}"):
+                # 同样的兼容修复
+                content = q.get('content') or q.get('question') or "⚠️ 内容缺失"
+                st.write(content)
+                if q.get('options'): st.radio("选项", q['options'], key=f"aq_{i}")
+                if st.button(f"💾 存入云端", key=f"ai_s_{i}"):
                     q['subject'] = subject
                     save_mistake(q)
                     st.toast("保存成功")
+                with st.expander("查看解析"):
+                    st.write(q.get('answer'))
+                    st.write(q.get('analysis'))
 
 elif menu == "📸 错题录入":
     st.title("📸 拍照错题上传 (云端版)")
-    st.info("⚠️ 注意：图片会压缩存储到表格中，请尽量上传清晰的小图。")
-    
     with st.container(border=True):
         c1, c2 = st.columns(2)
         up_subject = c1.selectbox("科目", ["数学", "物理", "化学", "英语", "语文"])
@@ -275,7 +304,7 @@ elif menu == "📸 错题录入":
                         "image_base64": img_str
                     }
                     if save_mistake(data):
-                        st.success("✅ 上传成功！图片已存入 Google Sheets。")
+                        st.success("✅ 上传成功！")
                         time.sleep(1)
                         st.rerun()
                     else:
@@ -288,7 +317,6 @@ elif menu == "📓 云端错题本":
     if not mistakes:
         st.info("云端数据库是空的，快去刷题吧！")
     else:
-        # 过滤需要复习的
         review_list = []
         for m in mistakes:
             if get_review_status(m['added_date'])[0]:
@@ -301,7 +329,6 @@ elif menu == "📓 云端错题本":
             st.caption(f"[{m['subject']}] {status}")
             with st.expander(f"查看详情...", expanded=False):
                 if m.get('is_image_upload'):
-                    # 解码图片
                     try:
                         img_data = base64.b64decode(m.get('image_base64', ''))
                         st.image(img_data)
